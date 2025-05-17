@@ -606,14 +606,13 @@ export default class Ship {
             );
             
             // Calculate force magnitude based on sail efficiency and wind power
-            this.forwardForce = windPower * sailEfficiency * 0.024;
+            // Apply a minimum efficiency of 0.35 (35%) to ensure the ship always gets some power
+            const minEfficiency = 0.35;
+            const baseEfficiency = Math.max(minEfficiency, sailEfficiency);
+            this.forwardForce = windPower * baseEfficiency * 0.024;
             
-            // Ensure the ship always moves forward even against the wind (with lower efficiency)
-            
-            // Calculate alignment factor for ship direction vs wind direction using the new half-circle model
-            // Maximum efficiency when directly pointing at wind direction
-            // 35% efficiency at the tolerance edges (90 degrees off wind)
-            let alignmentFactor;
+            // Calculate ship's orientation relative to wind for additional alignment factor
+            // This creates a more realistic sailing model without duplicating the efficiency calculation
             
             // Convert relative angle to absolute value in range 0 to PI
             const absRelativeAngle = Math.abs(relativeWindAngle);
@@ -621,28 +620,20 @@ export default class Ship {
             // Calculate the angle difference in degrees (0-180)
             const angleDiffDegrees = absRelativeAngle * 180 / Math.PI;
             
-            // Use the new half-circle model with linear interpolation
-            if (angleDiffDegrees <= 90) {
-                // Direct alignment (0 degrees): 1.0 efficiency
-                // Edge of tolerance (90 degrees): 0.35 efficiency
-                alignmentFactor = 1.0 - (0.65 * angleDiffDegrees / 90);
-            } else {
-                // Outside the half-circle range
-                alignmentFactor = 0.35 * Math.max(0, 1 - ((angleDiffDegrees - 90) / 90));
+            // Apply a gentle alignment factor based on how the ship is facing relative to wind
+            // This is separate from sail angle efficiency and represents hull hydrodynamics
+            // Ships move more efficiently when pointed with/against the wind than across it
+            let alignmentFactor = 1.0;
+            if (angleDiffDegrees > 45) {
+                // Slight reduction when moving across the wind (max 20% reduction)
+                alignmentFactor = 1.0 - Math.min(0.2, (angleDiffDegrees - 45) / 90 * 0.2);
             }
             
-            // Normalize to range 0.1-1.0
-            alignmentFactor = Math.max(0.1, alignmentFactor);
-            
-            // Make sure we apply force in the right direction based on the sails
-            // Only apply force if sails are actually catching wind effectively
-            const effectiveForce = sailEfficiency > 0 ? this.forwardForce * alignmentFactor : 0;
-            
-            // FIXED: Force is always applied in the ship's forward direction
-            // The wind just determines how much force (speed) the ship gets
+            // Force is always applied in the ship's forward direction
+            // The wind and sail efficiency just determine how much force (speed) the ship gets
             const forceVector = {
-                x: shipDirectionX * effectiveForce,
-                y: shipDirectionY * effectiveForce
+                x: shipDirectionX * this.forwardForce * alignmentFactor,
+                y: shipDirectionY * this.forwardForce * alignmentFactor
             };
             
             // Apply force in the ship's forward direction

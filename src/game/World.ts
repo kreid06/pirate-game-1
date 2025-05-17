@@ -116,15 +116,8 @@ export default class WorldManager {
         // Normalize to 0-1, where 1 is perfect North-South alignment
         const northSouthAlignment = 1 - (northSouthAxis / (Math.PI / 2));
         
-        // East is approximately π/2 (90°), West is approximately 3π/2 (270°)
-        // Check if wind is blowing within 30 degrees of east or west
-        const isEastWestWind = 
-            Math.abs(this.windDirection - Math.PI/2) < Math.PI/6 ||    // Near East (±30°)
-            Math.abs(this.windDirection - 3*Math.PI/2) < Math.PI/6;     // Near West (±30°)
-        
-        // If wind is blowing east or west, increase the minimum wind power by 50%
-        // Original minimum power is 0.5, so 50% increase makes it 0.75
-        const minWindPower = isEastWestWind ? 0.75 : 0.5;
+        // Set minimum wind power to 75% of maximum (2.0), which is 1.5
+        const minWindPower = 1.5;
         
         // Scale wind power from minWindPower to 2.0 based on alignment
         this.windPower = minWindPower + northSouthAlignment * (2.0 - minWindPower);
@@ -133,7 +126,7 @@ export default class WorldManager {
         this.windPower += (Math.random() - 0.5) * 0.1;
         
         // Clamp wind power to reasonable values
-        if (this.windPower < 0.5) this.windPower = 0.5;
+        if (this.windPower < 1.5) this.windPower = 1.5; // 75% of maximum
         if (this.windPower > 2.0) this.windPower = 2.0;
     }
     
