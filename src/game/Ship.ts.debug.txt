@@ -1,0 +1,10 @@
+    // Helper method to draw a cross marker for debugging
+    private drawDebugCrossAndLabel(ctx: CanvasRenderingContext2D, color: string, text: string, offsetY: number = 0): void {
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(-10, offsetY);
+        ctx.lineTo(10, offsetY);
+        ctx.moveTo(0, offsetY - 10);
+        ctx.lineTo(0, offsetY + 10);
+        ctx.stroke();
+    }
