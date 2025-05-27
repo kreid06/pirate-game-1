@@ -1,9 +1,9 @@
 import Matter from 'matter-js';
+import { BaseModule, CannonModule, SailModule, WheelModule } from './modules';
 
-// Define module types
 export type ModuleType = 'cannon' | 'sail' | 'wheel' | 'plank';
 
-// Define a ship module interface
+// Keeping the ShipModule interface for backward compatibility during transition
 export interface ShipModule {
     type: ModuleType;
     position: { x: number; y: number };
@@ -11,6 +11,7 @@ export interface ShipModule {
     health: number;
     openness?: number; // How open a sail is (0-100%)
     angle?: number;    // Angle of the sail relative to the mast (-45 to +45 degrees)
+    turretAngle?: number; // Angle of the cannon turret for aiming
     body?: Matter.Body;
     update(): void;
     use(): void;
@@ -23,7 +24,15 @@ export default class Ship {
     speed: number;
     health: number;
     body: Matter.Body;
-    modules: Map<string, ShipModule> = new Map();
+    
+    // Updated modules storage - can store both legacy and new module types
+    modules: Map<string, ShipModule | BaseModule> = new Map();
+    
+    // Typed collections for specific module types (for easier access)
+    cannons: Map<string, CannonModule> = new Map();
+    sails: Map<string, SailModule> = new Map();
+    wheels: Map<string, WheelModule> = new Map();
+    
     planks: Array<{ position: { x: number, y: number }, health: number, body: Matter.Body }> = [];
     waterLevel: number = 0;
     
@@ -37,6 +46,8 @@ export default class Ship {
     forwardForce: number = 0;      // Current forward propulsion force
     turningForce: number = 0;      // Current turning force
     momentum: number = 0;          // Ship's current momentum (affects turning)
+    isRotatingSails: boolean = false; // Flag to track when sails are being actively rotated
+    sailRotationTimer: number = 0;    // Timer to track how long sails have been rotating
     
     // Path for the brigantine ship shape
     path: Path2D | null = null;
@@ -50,6 +61,9 @@ export default class Ship {
     
     // Player status properties
     playerAtWheel: boolean = false;  // Track if player is at the wheel or freely walking
+
+    // Reference to the Game instance for adding cannonballs
+    private game: any;
 
     // --- Shared hull and feature definitions (single source of truth) ---
     // Hull path points (for Path2D and collision)
@@ -89,13 +103,12 @@ export default class Ship {
         path.quadraticCurveTo(p.sternTip.x, p.sternTip.y, p.stern.x, p.stern.y);
         path.closePath();
         return path;
-    }
-
-    constructor(x: number, y: number, _width: number, _height: number, speed: number) {
+    }    constructor(x: number, y: number, _width: number, _height: number, speed: number) {
         // Initialize position
         this.position = { x, y };
         this.speed = speed;
         this.health = 100; // Default health
+        this.game = null; // Initialize game reference
         
         // Initialize physics properties
         this.forwardForce = 0;
@@ -174,17 +187,53 @@ export default class Ship {
             health: 100,
             body: plankBody
         });
-    }
-    
-    // Add a module to the ship
-    addModule(id: string, module: ShipModule): boolean {
-        // Check if the position is valid
-        // In a real implementation, you'd check if the position is a valid mounting point
+    }      // Add a module to the ship
+    addModule(id: string, moduleOrData: ShipModule | BaseModule): boolean {
+        // Check if it's one of our new module types
+        if (moduleOrData instanceof BaseModule) {
+            const module = moduleOrData;
+            
+            // Store in the general modules map
+            this.modules.set(id, module);
+            
+            // Also store in the type-specific collection
+            if (module instanceof CannonModule) {
+                this.cannons.set(id, module);
+                // Set game reference for creating cannonballs
+                module.setGame(this);
+            } else if (module instanceof SailModule) {
+                this.sails.set(id, module);
+            } else if (module instanceof WheelModule) {
+                this.wheels.set(id, module);
+            }
+            
+            return true;
+        }
+        
+        // Handle legacy ShipModule object
+        const module = moduleOrData as ShipModule;
         
         // Check if this is a standard module with a predefined visual position
         this.ensureModuleVisualPosition(id, module);
         
+        // Store the module in the general map
         this.modules.set(id, module);
+          // Create and store the appropriate module class based on type
+        if (module.type === 'cannon') {
+            const cannonModule = new CannonModule(module.position, module.rotation);
+            cannonModule.turretAngle = module.turretAngle || 0;
+            cannonModule.setGame(this); // Pass the ship instance directly
+            this.cannons.set(id, cannonModule);
+        } else if (module.type === 'sail') {
+            const sailModule = new SailModule(module.position);
+            sailModule.openness = module.openness || 0;
+            sailModule.angle = module.angle || 0;
+            this.sails.set(id, sailModule);
+        } else if (module.type === 'wheel') {
+            const wheelModule = new WheelModule(module.position);
+            this.wheels.set(id, wheelModule);
+        }
+        
         return true;
     }
     
@@ -246,7 +295,21 @@ export default class Ship {
     
     // Update all modules
     updateModules(): void {
+        // Update all modules in the ship
+        
+        // First, update the specialized module collections
+        this.cannons.forEach(cannon => cannon.update());
+        this.sails.forEach(sail => sail.update());
+        this.wheels.forEach(wheel => wheel.update());
+        
+        // Update any remaining legacy modules
         this.modules.forEach((module, id) => {
+            // Skip updating modules that are already in the specialized collections
+            if (module instanceof BaseModule) {
+                // Already updated above
+                return;
+            }
+            
             // Make sure module positions are consistent with visual positions
             if (this.moduleVisualPositions.has(id)) {
                 // Update the moduleVisualPositions if needed for any dynamically moved modules
@@ -301,8 +364,7 @@ export default class Ship {
     }
 
     // Apply rudder force to turn the ship
-    applyRudder(direction: 'left' | 'right' | 'center'): void {
-        // Make rudder change rate more gradual
+    applyRudder(direction: 'left' | 'right' | 'center'): void {        // Make rudder change rate more gradual
         const baseRudderChangeRate = 0.5; // Base rate for rudder change
         
         // Calculate current ship speed
@@ -339,32 +401,57 @@ export default class Ship {
                 break;
         }
         
+        // Update wheel angle to match rudder angle (if we have wheels)
+        if (this.wheels.size > 0) {
+            // Get the first wheel (typically there's only one)
+            const wheel = this.wheels.values().next().value;
+            if (wheel) {
+                wheel.setWheelAngle(this.rudderAngle);
+            }
+        }
+        
         // Calculate sail power to correlate turning with wind force
         let sailPower = 0;
         let sailCount = 0;
         
-        // Calculate average sail openness and efficiency
-        this.modules.forEach(module => {
-            if (module.type === 'sail' && module.openness !== undefined && module.openness > 0) {
-                sailPower += module.openness;
+        // Calculate average sail openness and efficiency using the typed collection
+        this.sails.forEach(sail => {
+            if (sail.openness > 0) {
+                sailPower += sail.openness;
                 sailCount += 1;
             }
         });
-        
-        // Get average sail power as a factor between 0 and 1
+          // Get average sail power as a factor between 0 and 1
         const avgSailPower = sailCount > 0 ? sailPower / (sailCount * 100) : 0;
         
-        // Calculate base turning force
+        // Calculate base turning force with improved speed-based mechanics
         const baseTurningPower = 0.000015; // Base turning power constant
+          // IMPROVED TURNING LOGIC: Base turning on ship speed
+        // At very low speeds: difficult to turn (0.3 effectiveness)
+        // At medium speeds: optimal turning (1.0 effectiveness)
+        // At high speeds: harder to turn due to momentum (0.5 effectiveness)
         
-        // NEW TURNING LOGIC: Less effective at higher speeds due to inertia
-        // Calculate turning effectiveness as inverse to speed with a minimum value
-        // At speed 0: turnEffectiveness = 1.0
-        // At high speed: turnEffectiveness approaches 0.3
-        const turnEffectiveness = Math.max(0.3, 1 - (this.momentum * 0.7));
+        // Calculate speed factor - optimal turning at medium speeds
+        // This creates a bell curve with max turning at moderate speeds
+        const optimalSpeed = 2.0; // Speed at which turning is most effective
+        const speedDiff = Math.abs(currentSpeed - optimalSpeed);
         
-        // Apply sail power as a factor (no sails = reduced turning)
-        const sailFactor = 0.3 + 0.7 * avgSailPower;
+        // Create a more pronounced bell curve for speed-based turning
+        // This makes the difference between low, medium and high speeds more noticeable
+        const speedFactor = Math.max(0.25, Math.min(1.0, 1.0 - Math.pow(speedDiff / 3.0, 2)));
+        
+        // Calculate momentum resistance - faster ships are harder to turn
+        // More progressive resistance as momentum builds up
+        const momentumResistance = Math.max(0.4, 1.0 - (this.momentum * 0.6));
+        
+        // Combine factors for final turn effectiveness
+        const turnEffectiveness = speedFactor * momentumResistance;
+          // Apply sail power as a factor (no sails = reduced turning)
+        // Increased minimum turning capability even with closed sails
+        // Make turning more directly dependent on sail openness
+        const minTurnFactor = 0.35; // Minimum turning factor with no sails (increased from 0.3)
+        const maxTurnFactor = 1.0;  // Maximum turning factor with full sails
+        const sailFactor = minTurnFactor + ((maxTurnFactor - minTurnFactor) * avgSailPower);
         
         // Calculate final turning force
         this.turningForce = this.rudderAngle * baseTurningPower * turnEffectiveness * sailFactor;
@@ -379,8 +466,6 @@ export default class Ship {
         // Update visual position based on physics body position
         this.position.x = this.body.position.x;
         this.position.y = this.body.position.y;
-        
-        // Debug logging removed to be reimplemented
     }
     
     // Calculate wind power based on sail angle relative to wind direction
@@ -389,9 +474,10 @@ export default class Ship {
         let totalEfficiency = 0;
         let sailCount = 0;
         
-        this.modules.forEach(module => {
-            if (module.type === 'sail' && (module.openness || 0) > 0) {
-                const sailAngle = module.angle || 0; // Default to 0 if not set
+        // Use the typed sails collection instead of generic modules
+        this.sails.forEach(sailModule => {
+            if (sailModule.openness > 0) {
+                const sailAngle = sailModule.angle; // Now directly accessing SailModule properties
                 
                 // Calculate angle between wind and sail
                 // We need to account for:
@@ -451,9 +537,8 @@ export default class Ship {
                 
                 // Scale efficiency from 0-1 range
                 efficiency = Math.min(1, Math.max(0.35, efficiency));
-                
-                // Scale by sail openness
-                const sailOpenness = (module.openness || 0) / 100;
+                  // Scale by sail openness
+                const sailOpenness = sailModule.openness / 100;
                 
                 // Only add angle bonus if we already have some efficiency
                 let angleBonus = 0;
@@ -463,73 +548,120 @@ export default class Ship {
                     angleBonus = Math.min(0.2, Math.abs(sailAngle) / 75 * 0.2);
                 }
                 
+                // Apply sail openness as a direct multiplier to efficiency
+                // This ensures that sail openness directly affects how much power the sail generates
                 totalEfficiency += (efficiency + angleBonus) * sailOpenness;
                 sailCount++;
-            }
-        });
+            }        });
         
-        return sailCount > 0 ? Math.min(1.5, totalEfficiency / sailCount) : 0; // Cap at 150% efficiency
-    }
-    
-    // Rotate all sails by a certain angle
+        // Always provide at least some minimal efficiency when sails are open
+        // Return a value between 0 and 1.5 (capped at 150% efficiency)
+        if (sailCount > 0) {
+            // Base efficiency is the average across all sails
+            const baseEfficiency = Math.min(1.5, totalEfficiency / sailCount);
+            
+            // Ensure there's always a minimum efficiency of 0.2 (20%) when any sails are open
+            // This provides a more consistent sailing experience
+            return Math.max(0.2, baseEfficiency);
+        }
+        
+        return 0; // No sails open = no efficiency
+    }// Rotate all sails by a certain angle
     rotateSails(direction: 'left' | 'right' | 'center'): void {
         const rotationRate = 1.25; // Degrees per call (reduced to 25% of original 5 degrees)
         
-        this.modules.forEach(module => {
-            if (module.type === 'sail') {
-                // Initialize angle if not set
-                if (module.angle === undefined) {
-                    module.angle = 0;
-                }
-                
-                // Adjust angle based on direction
-                switch (direction) {
-                    case 'left':
-                        module.angle = Math.max(-75, module.angle - rotationRate);
-                        break;
-                    case 'right':
-                        module.angle = Math.min(75, module.angle + rotationRate);
-                        break;
-                    case 'center':
-                        // Return sails to center position
-                        if (module.angle > 0) {
-                            module.angle = Math.max(0, module.angle - rotationRate);
-                        } else if (module.angle < 0) {
-                            module.angle = Math.min(0, module.angle + rotationRate);
-                        }
-                        break;
-                }
-                
-                // Debug logging removed to be reimplemented
+        // Store current velocity before rotation
+        const currentVelocity = {
+            x: this.body.velocity.x,
+            y: this.body.velocity.y
+        };
+        
+        // Set flag to indicate sails are being rotated (just for animation purposes)
+        this.isRotatingSails = true;
+        this.sailRotationTimer = 10; // Set timer for how long sails are considered rotating
+        
+        // Use the typed sails collection
+        this.sails.forEach(sail => {
+            // Adjust angle based on direction
+            switch (direction) {
+                case 'left':
+                    sail.rotate(-rotationRate); // Use SailModule's rotate method
+                    break;
+                case 'right':
+                    sail.rotate(rotationRate);
+                    break;
+                case 'center':
+                    // Return sails to center position
+                    sail.centerAngle(rotationRate);
+                    break;
             }
         });
-    }
-
-    fireCannon(): void {
-        // Get all cannon modules
-        const cannons = Array.from(this.modules.values()).filter(module => module.type === 'cannon');
         
-        if (cannons.length === 0) {
-            // No cannons available
+        // Restore exact velocity from before rotation to prevent cumulative speed increases
+        Matter.Body.setVelocity(this.body, currentVelocity);    }    fireCannon(targetPosition?: { x: number, y: number }): void {
+        // Check if we have any cannons
+        if (this.cannons.size === 0) {
             return;
         }
-        
-        // Fire all cannons
-        cannons.forEach(cannon => {
-            cannon.use();
+          // Fire all cannons
+        this.cannons.forEach(cannon => {
+            // Mark cannon as used (cannon.fire will check if it's loaded)
+            // No need to call cannon.use() since cannon.fire handles the loading check
             
-            // Note: In a future implementation, we could add projectile physics here
-            // using the cannon's rotation to determine direction
-        });
-        
-        // Debug logging removed to be reimplemented
+            // Create a cannonball if we have a target position
+            if (targetPosition) {
+                // Convert cannon position from local to world coordinates
+                const cannonWorldPos = {
+                    x: this.position.x + Math.cos(this.body.angle) * cannon.position.x - Math.sin(this.body.angle) * cannon.position.y,
+                    y: this.position.y + Math.sin(this.body.angle) * cannon.position.x + Math.cos(this.body.angle) * cannon.position.y
+                };
+                
+                // Get the ship's current velocity to pass to the cannon
+                const shipVelocity = {
+                    x: this.body.velocity.x,
+                    y: this.body.velocity.y
+                };
+                
+                // Use the cannon's fire method to directly create the cannonball
+                const fired = cannon.fire(cannonWorldPos.x, cannonWorldPos.y, this.body.angle, shipVelocity);
+                
+                // Log successful firing
+                if (fired) {
+                    console.log('Cannon fired at world position:', cannonWorldPos);
+                }
+            }
+        });    }
+      // Create a cannonball projectile
+    private createCannonball(x: number, y: number, angle: number): void {
+        // If we have a game reference, use it to add the cannonball
+        if (this.game && this.game.addCannonball) {
+            // Use the game's method to create and add a cannonball
+            // We pass the current ship's velocity to add to the cannonball's initial velocity
+            const shipSpeed = Math.sqrt(
+                this.body.velocity.x * this.body.velocity.x + 
+                this.body.velocity.y * this.body.velocity.y
+            );
+            // The final speed is a combination of the base cannonball speed plus the ship's velocity
+            const finalSpeed = 10 + shipSpeed * 0.5; // Add half of the ship's speed to the cannonball
+            
+            this.game.addCannonball(x, y, angle, finalSpeed);
+        } else {
+            // Fallback when game reference is not set
+            console.error(`Cannot fire cannonball: game reference missing. Position: (${x}, ${y}), angle: ${angle}`);
+        }
     }
-
+    
+    // Take damage
     takeDamage(amount: number): void {
         this.health -= amount;
         if (this.health <= 0) {
             this.destroy();
         }
+    }
+    
+    // Set the game reference
+    setGame(game: any): void {
+        this.game = game;
     }
 
     // Apply wind forces to the ship based on sail configuration
@@ -544,19 +676,17 @@ export default class Ship {
         let sailCount = 0;
         let sailsAreOpen = false;
         
-        this.modules.forEach(module => {
-            if (module.type === 'sail') {
-                const openness = module.openness || 0;
-                totalSailOpenness += openness;
-                sailCount++;
-                
-                if (openness > 0) {
-                    sailsAreOpen = true;
-                }
+        // Use the typed sails collection
+        this.sails.forEach(sail => {
+            const openness = sail.openness;
+            totalSailOpenness += openness;
+            sailCount++;
+            
+            if (openness > 0) {
+                sailsAreOpen = true;
             }
         });
-        
-        // Average sail openness (0-100%)
+          // Average sail openness (0-100%)
         const avgSailOpenness = sailCount > 0 ? totalSailOpenness / sailCount : 0;
         
         // Apply drag based on sail openness and momentum
@@ -564,6 +694,8 @@ export default class Ship {
         // When sails are 100% open: lighter drag (0.98)
         // We also factor in the ship's momentum - more momentum = less drag
         const momentumFactor = Math.min(0.05, this.momentum * 0.05);
+        
+        // Calculate drag factor - don't consider sail rotation status
         const dragFactor = sailsAreOpen ? 
             0.85 + (avgSailOpenness / 100) * 0.13 + momentumFactor : // Add momentum bonus to drag reduction
             0.85; // Strong drag when sails are closed
@@ -583,8 +715,7 @@ export default class Ship {
             // Reset momentum when stopped
             this.momentum = 0;
         }
-        
-        // Only apply wind force if sails are open
+          // Only apply wind force if sails are open
         if (sailsAreOpen) {
             // Calculate sail efficiency based on wind angle
             const sailEfficiency = this.calculateSailEfficiency();
@@ -604,12 +735,22 @@ export default class Ship {
                 windDirectionY * shipDirectionX - windDirectionX * shipDirectionY,
                 windDirectionX * shipDirectionX + windDirectionY * shipDirectionY
             );
-            
-            // Calculate force magnitude based on sail efficiency and wind power
-            // Apply a minimum efficiency of 0.35 (35%) to ensure the ship always gets some power
-            const minEfficiency = 0.35;
+              // Calculate force magnitude based on sail efficiency, wind power, and sail openness
+            // Apply a minimum efficiency to ensure ship always gets some power when sails are open
+            const minEfficiency = 0.40; // Base minimum efficiency
             const baseEfficiency = Math.max(minEfficiency, sailEfficiency);
-            this.forwardForce = windPower * baseEfficiency * 0.024;
+            
+            // Apply a constant base wind force multiplied by sail openness percentage
+            // This ensures direct correlation between sail openness and ship speed
+            const opennessFactor = avgSailOpenness / 100; // Convert to 0-1 range
+            
+            // Apply a minimum constant wind force when sails are open
+            // This ensures the ship always moves when sails are open regardless of wind conditions
+            const constantWindBase = 0.8; // Constant base wind force when sails are open
+            const windForceFactor = 0.08; // Increased from 0.06 for better responsiveness
+            
+            // Combine constant base force with wind-dependent force
+            this.forwardForce = (constantWindBase + windPower) * baseEfficiency * windForceFactor * opennessFactor;
             
             // Calculate ship's orientation relative to wind for additional alignment factor
             // This creates a more realistic sailing model without duplicating the efficiency calculation
@@ -619,185 +760,64 @@ export default class Ship {
             
             // Calculate the angle difference in degrees (0-180)
             const angleDiffDegrees = absRelativeAngle * 180 / Math.PI;
-            
-            // Apply a gentle alignment factor based on how the ship is facing relative to wind
+              // Apply a gentle alignment factor based on how the ship is facing relative to wind
             // This is separate from sail angle efficiency and represents hull hydrodynamics
             // Ships move more efficiently when pointed with/against the wind than across it
             let alignmentFactor = 1.0;
-            if (angleDiffDegrees > 45) {
-                // Slight reduction when moving across the wind (max 20% reduction)
-                alignmentFactor = 1.0 - Math.min(0.2, (angleDiffDegrees - 45) / 90 * 0.2);
+            if (angleDiffDegrees <= 90) {
+                // Linear interpolation from 1.0 (direct) to 0.45 (90 degrees off) - increased from 0.35
+                // When angleDiffDegrees = 0: efficiency = 1.0
+                // When angleDiffDegrees = 90: efficiency = 0.45
+                alignmentFactor = 1.0 - (0.55 * angleDiffDegrees / 90); // Reduced penalty from 0.65 to 0.55
+            } else {
+                // Default to 45% efficiency when outside the optimal range - increased from 35%
+                alignmentFactor = 0.45 * Math.max(0, 1 - (angleDiffDegrees - 90) / 90);
             }
+            
+            // Scale to a minimum of 15% (increased from 10%)
+            alignmentFactor = Math.max(0.15, alignmentFactor);
+            
+            // Only apply forward force if we have some sail efficiency
+            const finalForce = sailEfficiency > 0 ? this.forwardForce * alignmentFactor : 0;
             
             // Force is always applied in the ship's forward direction
             // The wind and sail efficiency just determine how much force (speed) the ship gets
             const forceVector = {
-                x: shipDirectionX * this.forwardForce * alignmentFactor,
-                y: shipDirectionY * this.forwardForce * alignmentFactor
+                x: shipDirectionX * finalForce,
+                y: shipDirectionY * finalForce
             };
             
             // Apply force in the ship's forward direction
             Matter.Body.applyForce(this.body, this.body.position, forceVector);
-            
-            // Debug logging removed to be reimplemented
         }
     }
 
     // Open or close the sails by a specific percentage
     adjustSails(openPercent: number): void {
-        // Find all sail modules
-        this.modules.forEach(module => {
-            if (module.type === 'sail') {
-                // Ensure the value is between 0 and 100
-                const newOpenness = Math.max(0, Math.min(100, openPercent));
-                module.openness = newOpenness;
-                // Debug logging removed to be reimplemented
-            }
+        // Use the typed sails collection directly
+        this.sails.forEach(sail => {
+            sail.setOpenness(openPercent); // Use the SailModule's setOpenness method
         });
     }
 
     // Gradually open all sails by 10%
     openSails(): void {
-        // Get sail modules
-        const sailModules = Array.from(this.modules.values()).filter(m => m.type === 'sail');
-        
-        // Update each sail module
-        sailModules.forEach(module => {
-            if (module.openness !== undefined) {
-                const newOpenness = Math.min(100, module.openness + 10);
-                module.openness = newOpenness;
-            }
+        // Use the typed sails collection directly
+        this.sails.forEach(sail => {
+            sail.open(10); // Use the SailModule's open method
         });
-        
-        // Debug logging removed to be reimplemented
     }
 
     // Gradually close all sails by 10%
     closeSails(): void {
-        // Get sail modules
-        const sailModules = Array.from(this.modules.values()).filter(m => m.type === 'sail');
-        
-        // Update each sail module
-        sailModules.forEach(module => {
-            if (module.openness !== undefined) {
-                const newOpenness = Math.max(0, module.openness - 10);
-                module.openness = newOpenness;
-            }
+        // Use the typed sails collection directly
+        this.sails.forEach(sail => {
+            sail.close(10); // Use the SailModule's close method
         });
-        
-        // Debug logging removed to be reimplemented
     }
 
-    update(): void {
-        // Update visual position based on physics body position
-        this.position.x = this.body.position.x;
-        this.position.y = this.body.position.y;
-        
-        // Calculate current ship speed
-        const currentSpeed = Math.sqrt(
-            this.body.velocity.x ** 2 + 
-            this.body.velocity.y ** 2
-        );
-        
-        // Check if sails are open
-        let sailsAreOpen = false;
-        
-        this.modules.forEach(module => {
-            if (module.type === 'sail') {
-                const openness = module.openness || 0;
-                
-                if (openness > 0) {
-                    sailsAreOpen = true;
-                }
-            }
-        });
-        
-        // Update momentum value - this affects turning effectiveness
-        // Momentum gradually decreases when sails are closed
-        if (!sailsAreOpen) {
-            this.momentum = Math.max(0, this.momentum - 0.01);
-        } else {
-            // When sails are open, momentum updates based on speed
-            this.momentum = Math.min(1.0, this.momentum * 0.99 + currentSpeed * 0.01);
-        }
-        
-        // Only apply extra drag when sails are closed
-        if (!sailsAreOpen) {
-            // Apply a small amount of additional drag to ensure the ship stops naturally
-            const velocityDecay = 0.985; // Slightly lower decay for more natural motion
-            Matter.Body.setVelocity(this.body, {
-                x: this.body.velocity.x * velocityDecay,
-                y: this.body.velocity.y * velocityDecay
-            });
-            
-            // Apply stronger stopping force when the ship is moving very slowly
-            // This prevents the ship from drifting indefinitely
-            if (Math.abs(this.body.velocity.x) < 0.08 && Math.abs(this.body.velocity.y) < 0.08) {
-                const strongDrag = 0.85; // Slightly higher value to allow more slow drift
-                Matter.Body.setVelocity(this.body, {
-                    x: this.body.velocity.x * strongDrag,
-                    y: this.body.velocity.y * strongDrag
-                });
-                
-                // Stop completely if extremely slow
-                if (Math.abs(this.body.velocity.x) < 0.005 && Math.abs(this.body.velocity.y) < 0.005) {
-                    Matter.Body.setVelocity(this.body, { x: 0, y: 0 });
-                    // Reset momentum when stopped
-                    this.momentum = 0;
-                }
-            }
-        } else {
-            // With sails open, apply a very minor decay to simulate water resistance
-            const waterResistance = 0.997;
-            Matter.Body.setVelocity(this.body, {
-                x: this.body.velocity.x * waterResistance,
-                y: this.body.velocity.y * waterResistance
-            });
-        }
-        
-        // Update water level
-        this.updateWaterLevel();
-        
-        // Update modules
-        this.updateModules();
-    }
-    
-    // Set a flag to indicate if the player is on this ship
-    // This can be used by other systems to modify physics behavior
-    setPlayerOnBoard(isPlayerOnBoard: boolean, isAtWheel: boolean = false): void {
-        // Update player at wheel tracking
-        this.playerAtWheel = isAtWheel;
-        
-        if (isPlayerOnBoard) {
-            // When player boards, we can disable specific collision types if needed
-            Matter.Body.set(this.body, {
-                collisionFilter: {
-                    ...this.body.collisionFilter,
-                    group: -1 // Negative group means it won't collide with other bodies in the same group
-                }
-            });
-        } else {
-            // Restore normal collision behavior when player leaves
-            Matter.Body.set(this.body, {
-                collisionFilter: {
-                    ...this.body.collisionFilter,
-                    group: 0 // Reset to default group
-                }
-            });
-            
-            // Reset wheel status when player leaves ship completely
-            this.playerAtWheel = false;
-        }
-    }
-    
-    // Toggle player between steering wheel and walking on deck
-    togglePlayerAtWheel(isAtWheel: boolean): void {
-        this.playerAtWheel = isAtWheel;
-    }
-    
-    // Check if a position is on the ship's deck (always matches visual hull shape, excludes obstacles)
+    // Check if a position is on the ship's deck (matches visual hull if ctx provided, excludes obstacles)
     isPositionOnDeck(x: number, y: number, ctx?: CanvasRenderingContext2D): boolean {
-        // Transform world coordinates to ship's local space
         const localX = x - this.position.x;
         const localY = y - this.position.y;
         const cosA = Math.cos(-this.body.angle);
@@ -805,118 +825,93 @@ export default class Ship {
         const rotatedX = localX * cosA - localY * sinA;
         const rotatedY = localX * sinA + localY * cosA;
         
-        // Always ensure path exists
-        if (!this.path) {
-            this.path = Ship.createHullPath();
-        }
-        
-        // First check: Is point inside the hull?
-        let isInHull = false;
-        
-        if (ctx) {
-            // If we have a context, use it directly
-            isInHull = ctx.isPointInPath(this.path, rotatedX, rotatedY);
+        // Use hull path for walkable area if available
+        if (this.path && ctx) {
+            // Use the path to determine if point is inside hull
+            if (!ctx.isPointInPath(this.path, rotatedX, rotatedY)) {
+                return false; // Outside hull
+            }
         } else {
-            // Use the bounding path as an approximation when no context
-            // This checks if the point is roughly within the hull bounds
-            // Reduce bow (front) and stern (back) walkable areas to match visual appearance
-            isInHull = (
-                rotatedX >= -300 && rotatedX <= 320 && 
-                rotatedY >= -90 && rotatedY <= 90 &&
-                // Enhanced bow curvature - uses quadratic curve simulation instead of triangular shape
-                // This creates a more realistic curved bow shape that follows the visual hull
-                !(rotatedX > 150 && (Math.abs(rotatedY) > 90 * (1 - Math.pow((rotatedX - 150) / 175, 2)))) &&
-                // Enhanced stern curvature - also uses quadratic curve for better visual matching
-                // Creates a more realistic curved stern shape that follows the visual hull
-                !(rotatedX < -220 && (Math.abs(rotatedY) > 90 * (1 - Math.pow((Math.abs(rotatedX) - 220) / 85, 2))))
-            );
-        }
-        
-        if (!isInHull) return false;
-        
-        // Second check: Exclude obstacles
-        // Exclude masts
-        for (const mast of Ship.MASTS) {
-            const dx = rotatedX - mast.x, dy = rotatedY - mast.y;
-            if (dx*dx + dy*dy < mast.r*mast.r) return false;
-        }
-        // Exclude wheel (rectangle)
-        const wx = Ship.WHEEL.x, wy = Ship.WHEEL.y, ww = Ship.WHEEL.w, wh = Ship.WHEEL.h;
-        if (
-            rotatedX > wx - ww/2 && rotatedX < wx + ww/2 &&
-            rotatedY > wy - wh/2 && rotatedY < wy + wh/2
-        ) return false;
-        // Exclude cannons
-        for (const cannon of Ship.CANNONS) {
-            if (
-                rotatedX > cannon.x - cannon.w/2 && rotatedX < cannon.x + cannon.w/2 &&
-                rotatedY > cannon.y - cannon.h/2 && rotatedY < cannon.y + cannon.h/2
-            ) return false;
-        }
-        
-        // Also check dynamic module obstacles using their visual positions
-        for (const [id, module] of this.modules.entries()) {
-            // Skip modules that are already handled by static obstacles
-            const isStaticObstacle = 
-                (module.type === 'wheel' && module.position.x === Ship.WHEEL.x && module.position.y === Ship.WHEEL.y) ||
-                (module.type === 'cannon' && Ship.CANNONS.some(c => 
-                    c.x === module.position.x && c.y === module.position.y));
-            
-            if (!isStaticObstacle) {
-                // Get visual position for collision detection
-                const visualPos = this.getModuleVisualPosition(id);
-                const moduleSize = 20; // Default size for modules
-                
-                // Simple box collision check
-                if (
-                    rotatedX > visualPos.x - moduleSize/2 && rotatedX < visualPos.x + moduleSize/2 &&
-                    rotatedY > visualPos.y - moduleSize/2 && rotatedY < visualPos.y + moduleSize/2
-                ) return false;
+            // Fallback to simple boundary check if path isn't available
+            // Based on hull points: bow, stern, etc.
+            if (rotatedX < -345 || rotatedX > 415 || rotatedY < -90 || rotatedY > 90) {
+                return false; // Outside ship boundaries
             }
         }
         
-        return true;
+        // Check obstacles - masts
+        for (const mast of Ship.MASTS) {
+            const dx = rotatedX - mast.x;
+            const dy = rotatedY - mast.y;
+            if (dx * dx + dy * dy < mast.r * mast.r) {
+                return false; // Inside mast obstacle
+            }
+        }
+        
+        // Check obstacle - wheel
+        const wx = Ship.WHEEL.x, wy = Ship.WHEEL.y, ww = Ship.WHEEL.w, wh = Ship.WHEEL.h;
+        if (rotatedX > wx - ww/2 && rotatedX < wx + ww/2 && 
+            rotatedY > wy - wh/2 && rotatedY < wy + wh/2) {
+            return false; // Inside wheel obstacle
+        }
+        
+        // Check obstacles - cannons
+        for (const cannon of Ship.CANNONS) {
+            if (rotatedX > cannon.x - cannon.w/2 && rotatedX < cannon.x + cannon.w/2 && 
+                rotatedY > cannon.y - cannon.h/2 && rotatedY < cannon.y + cannon.h/2) {
+                return false; // Inside cannon obstacle
+            }
+        }
+        
+        // Check dynamic module obstacles
+        for (const [id, module] of this.modules.entries()) {
+            // Skip standard obstacles already checked above
+            if ((module.type === 'wheel' && module.position.x === Ship.WHEEL.x && module.position.y === Ship.WHEEL.y) ||
+                (module.type === 'cannon' && Ship.CANNONS.some(c => 
+                    c.x === module.position.x && c.y === module.position.y))) {
+                continue;
+            }
+            
+            // Check against the module's position
+            const visualPos = this.getModuleVisualPosition(id);
+            const moduleSize = 20; // Default size for modules
+            
+            // Simple box collision check
+            if (rotatedX > visualPos.x - moduleSize/2 && rotatedX < visualPos.x + moduleSize/2 &&
+                rotatedY > visualPos.y - moduleSize/2 && rotatedY < visualPos.y + moduleSize/2) {
+                return false; // Inside module obstacle
+            }
+        }
+        
+        return true; // No obstacles found, position is walkable
     }
-
-    destroy() {
-        // Debug logging removed to be reimplemented
-        // Logic for ship destruction
-    }
-
+    
     // Draw the ship using the provided context
     draw(ctx: CanvasRenderingContext2D): void {
         ctx.save();
-        
-        // Center visuals on the unified center point
         ctx.translate(this.position.x, this.position.y);
         ctx.rotate(this.body.angle);
-        
-        // Create hull path if needed and draw it
         if (!this.path) this.path = Ship.createHullPath();
-        
-        // Draw hull with wood texture effect
         ctx.fillStyle = '#D2B48C';
         ctx.strokeStyle = '#8B4513';
         ctx.lineWidth = 10;
         ctx.fill(this.path);
         ctx.stroke(this.path);
-        
-        // Draw deck features in order
-        
-        // Draw cannons
-        for (const cannon of Ship.CANNONS) {
-            this.drawCannon(ctx, cannon.x, cannon.y, cannon.y > 0 ? Math.PI : 0);
+        // Draw all modules (cannons, sails, wheel, etc.)
+        for (const module of this.modules.values()) {
+            if (typeof (module as any).draw === 'function') {
+                (module as any).draw(ctx);
+            } else {
+                // Fallback to legacy rendering for modules without draw()
+                if (module.type === 'cannon') {
+                    this.drawCannon(ctx, module.position.x, module.position.y, module.rotation);
+                } else if (module.type === 'sail') {
+                    this.drawMastAndSail(ctx, module.position.x, module.position.y, (module as any).openness || 0);
+                } else if (module.type === 'wheel') {
+                    this.drawSteeringWheel(ctx, module.position.x, module.position.y);
+                }
+            }
         }
-        
-        // Draw masts and sails
-        for (const mast of Ship.MASTS) {
-            this.drawMastAndSail(ctx, mast.x, mast.y, this.getSailOpennessAt(mast.x, mast.y));
-        }
-        
-        // Draw wheel
-        this.drawSteeringWheel(ctx, Ship.WHEEL.x, Ship.WHEEL.y);
-        
-        // Restore context to original state
         ctx.restore();
     }
     
@@ -939,17 +934,35 @@ export default class Ship {
         // Find the sail module for this position to get its angle
         let sailAngle = 0;
         
-        // Find matching sail module by position
-        for (const [id, module] of this.modules.entries()) {
-            if (module.type === 'sail') {
-                // Get the visual position for comparison
-                const visualPos = this.getModuleVisualPosition(id);
+        // Check specialized sails collection first
+        for (const [id, sail] of this.sails.entries()) {
+            // Get the visual position for comparison
+            const visualPos = this.getModuleVisualPosition(id);
+            
+            if (visualPos.x === x && visualPos.y === y) {
+                sailAngle = sail.angle;
+                break;
+            }
+        }
+        
+        // Fallback to checking all modules for legacy support
+        if (sailAngle === 0) {
+            for (const [id, module] of this.modules.entries()) {
+                if (module instanceof SailModule) {
+                    // Already checked above
+                    continue;
+                }
                 
-                if (visualPos.x === x && visualPos.y === y) {
-                    if (module.angle !== undefined) {
-                        sailAngle = module.angle;
+                if (module.type === 'sail') {
+                    // Get the visual position for comparison
+                    const visualPos = this.getModuleVisualPosition(id);
+                    
+                    if (visualPos.x === x && visualPos.y === y) {
+                        // Type assert to ShipModule to access legacy properties
+                        const legacyModule = module as ShipModule;
+                        sailAngle = legacyModule.angle || 0;
+                        break;
                     }
-                    break;
                 }
             }
         }
@@ -1078,31 +1091,55 @@ export default class Ship {
         // }
         
         ctx.restore();
-    }
-    
-    // Helper method to draw a cannon
+    }    // Helper method to draw a cannon
     private drawCannon(ctx: CanvasRenderingContext2D, x: number, y: number, rotation: number): void {
         ctx.save();
         ctx.translate(x, y);
         ctx.rotate(rotation);
         
-        // Draw cannon base
+        // Find the cannon module for this position to get its turret angle
+        let turretAngle = 0;
+        
+        // Check specialized cannons collection first
+        for (const [id, cannon] of this.cannons.entries()) {
+            // Get the visual position for comparison
+            const visualPos = this.getModuleVisualPosition(id);
+            
+            if (visualPos.x === x && visualPos.y === y) {
+                turretAngle = cannon.turretAngle;
+                break;
+            }
+        }
+        
+        // Fallback to checking all modules for legacy support
+        if (turretAngle === 0) {
+            for (const [id, module] of this.modules.entries()) {
+                if (module instanceof CannonModule) {
+                    // Already checked above
+                    continue;
+                }
+                
+                if (module.type === 'cannon') {
+                    // Get the visual position for comparison
+                    const visualPos = this.getModuleVisualPosition(id);
+                    
+                    if (visualPos.x === x && visualPos.y === y) {
+                        // Type assert to ShipModule to access legacy properties
+                        const legacyModule = module as ShipModule;
+                        turretAngle = legacyModule.turretAngle || 0;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Draw cannon base (doesn't rotate with turret)
         ctx.fillStyle = '#8B4513';
         ctx.strokeStyle = '#000000';
         ctx.lineWidth = 2;
         ctx.fillRect(-15, -10, 30, 20);
         ctx.strokeRect(-15, -10, 30, 20);
 
-        // Draw cannon barrel
-        ctx.fillStyle = '#333333';
-        ctx.beginPath();
-        ctx.moveTo(-8, 0);
-        ctx.lineTo(-8, -40);
-        ctx.lineTo(8, -40);
-        ctx.lineTo(8, 0);
-        ctx.closePath();
-        ctx.fill();
-        
         // Draw cannon wheels
         ctx.fillStyle = '#654321';
         ctx.beginPath();
@@ -1112,6 +1149,27 @@ export default class Ship {
         ctx.arc(10, 10, 5, 0, Math.PI * 2);
         ctx.fill();
         
+        // Save context to apply turret rotation
+        ctx.save();
+        
+        // For the visual representation, rotate by turretAngle
+        ctx.rotate(turretAngle);
+        
+        // Draw cannon turret (barrel)
+        // Use 40 units length to match our firing calculation
+        ctx.fillStyle = '#333333';
+        ctx.beginPath();
+        ctx.moveTo(-8, 0);
+        ctx.lineTo(-8, -40);
+        ctx.lineTo(8, -40);
+        ctx.lineTo(8, 0);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Restore context from turret rotation
+        ctx.restore();
+        
+        // Restore main context
         ctx.restore();
     }
 
@@ -1305,20 +1363,181 @@ export default class Ship {
         
         // If we couldn't find a good position, use the center of the ship as a last resort
         return { x: this.position.x, y: this.position.y };
-    }
-
-    // --- Helper to get sail openness at a mast position ---
+    }    // --- Helper to get sail openness at a mast position ---
     private getSailOpennessAt(x: number, y: number): number {
+        // Check the specialized sails collection first for better performance
+        for (const [id, sail] of this.sails.entries()) {
+            // Get visual position to compare with the requested mast position
+            const visualPos = this.getModuleVisualPosition(id);
+            if (visualPos.x === x && visualPos.y === y) {
+                return sail.openness / 100;
+            }
+        }
+        
+        // Fallback to checking all modules (for backward compatibility)
         for (const [id, module] of this.modules.entries()) {
-            if (module.type === 'sail' && module.openness !== undefined) {
+            if (module instanceof SailModule) {
+                // Already checked above in the specialized collection
+                continue;
+            }
+            
+            if (module.type === 'sail') {
                 // Get visual position to compare with the requested mast position
                 const visualPos = this.getModuleVisualPosition(id);
                 if (visualPos.x === x && visualPos.y === y) {
-                    return module.openness / 100;
+                    // For legacy modules, openness would be undefined in BaseModule
+                    // so we need to type assert to access the property
+                    const legacyModule = module as ShipModule;
+                    return (legacyModule.openness || 0) / 100;
                 }
             }
         }
         return 0;
+    }
+    
+    // Destroy the ship and all its modules
+    destroy(): void {
+        // Clean up and notify all modules that the ship is being destroyed
+        
+        // First handle the specialized module collections
+        this.cannons.forEach(cannon => {
+            cannon.onDestroy();
+        });
+        this.sails.forEach(sail => {
+            sail.onDestroy();
+        });
+        this.wheels.forEach(wheel => {
+            wheel.onDestroy();
+        });
+        
+        // Then handle any remaining legacy modules
+        this.modules.forEach(module => {
+            if (module instanceof BaseModule) {
+                // Already processed above
+                return;
+            }
+            
+            // For legacy modules, call their update method which may have cleanup logic
+            module.update();
+        });
+        
+        // Clear all module collections
+        this.cannons.clear();
+        this.sails.clear();
+        this.wheels.clear();
+        this.modules.clear();
+        
+        // Clean up physics body if needed
+        if (this.body) {
+            // In a real implementation, we would tell the physics world to remove this body
+            // Assuming a method exists in the game to handle this
+            if (this.game && typeof this.game.removeBody === 'function') {
+                this.game.removeBody(this.body);
+            }
+        }
+        
+        // Set health to 0 to ensure the ship is marked as destroyed
+        this.health = 0;
+    }
+
+    // Toggle player between steering wheel and walking on deck
+    togglePlayerAtWheel(isAtWheel: boolean): void {
+        this.playerAtWheel = isAtWheel;
+    }
+    
+    // Set the player on board status
+    setPlayerOnBoard(isOnBoard: boolean, isAtWheel: boolean = false): void {
+        this.playerAtWheel = isAtWheel;
+        
+        // Modify collision filter for physics (if implemented)
+        if (isOnBoard) {
+            // Set ship to not collide with player when on board
+            Matter.Body.set(this.body, {
+                collisionFilter: {
+                    ...this.body.collisionFilter,
+                    group: -1 // Negative group means don't collide with same group
+                }
+            });
+        } else {
+            // Reset collision when player leaves
+            Matter.Body.set(this.body, {
+                collisionFilter: {
+                    ...this.body.collisionFilter,
+                    group: 0 // Reset to default group
+                }
+            });
+            
+            // Reset wheel status when player leaves ship completely
+            this.playerAtWheel = false;
+        }    }
+      // Update the ship's position, rotation, and internal state
+    update(): void {
+        // Check if any sails are open to determine sail status
+        let sailsAreOpen = false;
+        let avgSailOpenness = 0;
+        let sailCount = 0;
+        
+        this.sails.forEach(sail => {
+            if (sail.openness > 0) {
+                sailsAreOpen = true;
+                avgSailOpenness += sail.openness;
+                sailCount++;
+            }
+        });
+        
+        if (sailCount > 0) {
+            avgSailOpenness /= sailCount;
+        }
+          // Apply drag to slow the ship based on sail openness and rotation state
+        let dragFactor = 0.85; // Base drag (no sails open)
+        
+        // Reduce drag when sails are open based on openness percentage
+        if (sailsAreOpen) {
+            // Calculate a drag reduction based on sail openness (0-100%)
+            const opennessFactor = avgSailOpenness / 100;
+            
+            // More progressive drag reduction based on sail openness
+            // Min drag with closed sails: 0.85
+            // Max drag reduction with fully open sails: 0.98
+            dragFactor = 0.85 + (opennessFactor * 0.13);
+        }
+        
+        // Use reduced drag when rotating sails to maintain momentum
+        if (this.isRotatingSails) {
+            dragFactor = Math.max(dragFactor, 0.95); // Reduced drag during sail rotation
+            
+            // Decrement the timer
+            this.sailRotationTimer--;
+            
+            // Reset the flag when the timer reaches zero
+            if (this.sailRotationTimer <= 0) {
+                this.isRotatingSails = false;
+            }
+        }
+            
+        Matter.Body.setVelocity(this.body, {
+            x: this.body.velocity.x * dragFactor,
+            y: this.body.velocity.y * dragFactor
+        });
+            // Stop the ship completely if it's moving very slowly and sails are closed
+        // Only apply complete stop when sails are closed
+        if (!sailsAreOpen && 
+            Math.abs(this.body.velocity.x) < 0.01 && 
+            Math.abs(this.body.velocity.y) < 0.01) {
+            // Completely stop the ship when sails are closed and it's moving very slowly
+            Matter.Body.setVelocity(this.body, { x: 0, y: 0 });
+            this.momentum = 0;
+        }
+        
+        // Update visual position based on physics body position
+        this.position.x = this.body.position.x;
+        this.position.y = this.body.position.y;
+        
+        // Update water level based on damage
+        this.updateWaterLevel();
+        
+        // Update all modules
+        this.updateModules();
     }
 }
 

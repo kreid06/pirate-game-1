@@ -2,11 +2,13 @@
 // Fixed ship collision box alignment: The visual representation now matches the physics body with a 100px X-offset
 // Press 'G' to toggle walkable area test visualization and 'L' for debug info
 
-import Matter, { Engine, World } from 'matter-js';
+import Matter, { Engine } from 'matter-js';
 import Player from './Player';
-import Ship from './Ship';
+import Ship, { ShipModule } from './Ship';
 import Enemy from './Enemy';
 import WorldManager from './World';
+import Cannonball from './Cannonball';
+import { CannonModule, SailModule, WheelModule } from './modules';
 
 export class Game {
     private engine: Engine;
@@ -17,9 +19,10 @@ export class Game {
     private canvas: HTMLCanvasElement;
     private ctx: CanvasRenderingContext2D;
     private keysPressed: Set<string> = new Set();
-    private playerOnShip: boolean = false;
-    private mousePosition: { x: number, y: number } = { x: 0, y: 0 };
+    private playerOnShip: boolean = false;    private mousePosition: { x: number, y: number } = { x: 0, y: 0 };
     private screenMousePosition: { x: number, y: number } = { x: 0, y: 0 };
+    private cannonballs: Cannonball[] = []; // Array to store active cannonballs
+    private rightMouseDown: boolean = false; // Track right mouse button state
     
     // Debug mode flags
     private debugMode: boolean = false;
@@ -52,9 +55,11 @@ export class Game {
         // Initialize player
         this.player = new Player(400, 300);
         this.player.setOnShip(this.playerOnShip); // Sync the onShip property with Game's state
-        
-        // Initialize ship with brigantine dimensions
+          // Initialize ship with brigantine dimensions
         this.ship = new Ship(400, 350, 450, 180, 1);
+        
+        // Connect ship with game for cannonball creation
+        this.ship.setGame(this);
         
         // Add ship modules
         this.addInitialShipModules();
@@ -71,108 +76,19 @@ export class Game {
 
     // Set up initial ship configuration with basic modules
     private addInitialShipModules(): void {
-        // These modules would be properly implemented with their own classes
-        // For now we'll just stub them out
-        this.ship.addModule('wheel', {
-            type: 'wheel',
-            position: { x: -50, y: 0 },  // Position matches the steering wheel drawing position
-            rotation: 0,
-            health: 100,
-            update() {},
-            use() {} // Removed console.log
-        });
-        
-        // Front sail (sail1)
-        this.ship.addModule('sail1', {
-            type: 'sail',
-            position: { x: 165, y: 0 }, // Aligned with Ship.MASTS[0]
-            rotation: 0,
-            health: 100,
-            openness: 0, // Start with sail closed
-            angle: 0,    // Start with centered sail angle
-            update() {},
-            use() {} // Removed console.log
-        });
-        
-        // Middle sail (sail2)
-        this.ship.addModule('sail2', {
-            type: 'sail',
-            position: { x: -35, y: 0 }, // Aligned with Ship.MASTS[1]
-            rotation: 0,
-            health: 100,
-            openness: 0, // Start with sail closed
-            angle: 0,    // Start with centered sail angle
-            update() {},
-            use() {} // Removed console.log
-        });
-        
-        // Back sail (sail3)
-        this.ship.addModule('sail3', {
-            type: 'sail',
-            position: { x: -235, y: 0 }, // Aligned with Ship.MASTS[2]
-            rotation: 0,
-            health: 100,
-            openness: 0, // Start with sail closed
-            angle: 0,    // Start with centered sail angle
-            update() {},
-            use() {} // Removed console.log
-        });
-        
-        // Bottom cannons
-        this.ship.addModule('cannon1', {
-            type: 'cannon',
-            position: { x: -35, y: 75 }, // Aligned with Ship.CANNONS[0]
-            rotation: Math.PI, // Pointing down
-            health: 100,
-            update() {},
-            use() {} // Removed console.log
-        });
-        
-        this.ship.addModule('cannon2', {
-            type: 'cannon',
-            position: { x: 65, y: 75 }, // Aligned with Ship.CANNONS[1]
-            rotation: Math.PI, // Pointing down
-            health: 100,
-            update() {},
-            use() {} // Removed console.log
-        });
-        
-        this.ship.addModule('cannon3', {
-            type: 'cannon',
-            position: { x: -135, y: 75 }, // Aligned with Ship.CANNONS[2]
-            rotation: Math.PI, // Pointing down
-            health: 100,
-            update() {},
-            use() {} // Removed console.log
-        });
-        
-        // Top cannons
-        this.ship.addModule('cannon4', {
-            type: 'cannon',
-            position: { x: -35, y: -75 }, // Aligned with Ship.CANNONS[3]
-            rotation: 0, // Pointing up
-            health: 100,
-            update() {},
-            use() {} // Removed console.log
-        });
-        
-        this.ship.addModule('cannon5', {
-            type: 'cannon',
-            position: { x: 65, y: -75 }, // Aligned with Ship.CANNONS[4]
-            rotation: 0, // Pointing up
-            health: 100,
-            update() {},
-            use() {} // Removed console.log
-        });
-        
-        this.ship.addModule('cannon6', {
-            type: 'cannon',
-            position: { x: -135, y: -75 }, // Aligned with Ship.CANNONS[5]
-            rotation: 0, // Pointing up
-            health: 100,
-            update() {},
-            use() {} // Removed console.log
-        });
+        // Wheel
+        this.ship.addModule('wheel', new WheelModule({ x: -50, y: 0 }));
+        // Sails
+        this.ship.addModule('sail1', new SailModule({ x: 165, y: 0 }));
+        this.ship.addModule('sail2', new SailModule({ x: -35, y: 0 }));
+        this.ship.addModule('sail3', new SailModule({ x: -235, y: 0 }));
+        // Cannons
+        this.ship.addModule('cannon1', new CannonModule({ x: -35, y: 75 }, Math.PI));
+        this.ship.addModule('cannon2', new CannonModule({ x: 65, y: 75 }, Math.PI));
+        this.ship.addModule('cannon3', new CannonModule({ x: -135, y: 75 }, Math.PI));
+        this.ship.addModule('cannon4', new CannonModule({ x: -35, y: -75 }, 0));
+        this.ship.addModule('cannon5', new CannonModule({ x: 65, y: -75 }, 0));
+        this.ship.addModule('cannon6', new CannonModule({ x: -135, y: -75 }, 0));
     }
     
     // Set up keyboard and mouse input handlers
@@ -192,12 +108,50 @@ export class Game {
             const rect = this.canvas.getBoundingClientRect();
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top;
-            
-            // Store raw screen coordinates
+              // Store raw screen coordinates
             this.screenMousePosition = { x: mouseX, y: mouseY };
             
             // Convert screen coordinates to world coordinates
             this.mousePosition = this.screenToWorldCoordinates(mouseX, mouseY);
+            
+            // Update cannon turret angles only when player is at the wheel and holding right click
+            if (this.playerOnShip && this.player.atShipWheel && this.rightMouseDown) {
+                this.updateCannonAiming();
+            }
+        });// Mouse button handlers for cannon control
+        this.canvas.addEventListener('mousedown', (e) => {
+            // Check if player is on ship
+            if (this.playerOnShip) {
+                if (e.button === 0) {
+                    // Left mouse button - fire cannons
+                    // Allow firing regardless of whether the player is at the wheel or not
+                    this.ship.fireCannon(this.mousePosition);
+                    e.preventDefault();
+                } else if (e.button === 2) {
+                    // Right mouse button - set flag for cannon aiming
+                    this.rightMouseDown = true;
+                    e.preventDefault();
+                }
+            }        });
+          // Add mouse up handler to track when right click is released
+        this.canvas.addEventListener('mouseup', (e) => {
+            if (e.button === 2) {
+                this.rightMouseDown = false;
+                // We no longer reset cannon angles when right click is released
+                // This allows cannons to stay at their current position
+            }
+        });
+        
+        // Mouse leave handler to ensure right click state is reset when mouse leaves canvas
+        this.canvas.addEventListener('mouseleave', () => {
+            this.rightMouseDown = false;
+            // We no longer reset cannon angles when mouse leaves canvas
+            // This allows cannons to stay at their current position
+        });// Right click context menu event for aiming
+        this.canvas.addEventListener('contextmenu', (e) => {
+            // Prevent the context menu from appearing
+            e.preventDefault();
+            // No need to call updateCannonAiming here, it will be handled in the update loop
         });
         
         // Mouse wheel for zooming
@@ -234,10 +188,12 @@ export class Game {
             else if (e.key.toLowerCase() === 'l') { // 'L' to toggle debug collision shapes
                 this.debugMode = !this.debugMode;
                 // Debug message removed
-            }
-            else if (e.key.toLowerCase() === 'g') { // 'G' to toggle the walkable area test grid
+            }            else if (e.key.toLowerCase() === 'g') { // 'G' to toggle the walkable area test grid
                 this.showWalkableTest = !this.showWalkableTest;
                 // Debug message removed
+            }
+            else if (e.key.toLowerCase() === 'r') { // 'R' to reset cannon angles
+                this.resetCannonAngles();
             }
         });
     }
@@ -458,9 +414,8 @@ export class Game {
                 mask: defaultCategory | playerCategory // Ship collides with default and player categories
             }
         });
-        
-        // Add entities to the physics world
-        World.add(this.engine.world, [this.player.body, this.ship.body]);
+          // Add entities to the physics world
+        Matter.World.add(this.engine.world, [this.player.body, this.ship.body]);
         
         // Add a few enemy ships
         this.spawnEnemies(3);
@@ -471,9 +426,8 @@ export class Game {
             const x = 500 + Math.random() * 1000;
             const y = 500 + Math.random() * 1000;
             const enemy = new Enemy(x, y, 100, 0.5, 'aggressive');
-            
-            this.enemies.push(enemy);
-            World.add(this.engine.world, enemy.body);
+              this.enemies.push(enemy);
+            Matter.World.add(this.engine.world, enemy.body);
         }
     }
     
@@ -548,12 +502,19 @@ export class Game {
                     x: helmPositionX,
                     y: helmPositionY
                 });
-                
-                // Keep player and ship in sync with velocity
+                  // Keep player and ship in sync with velocity
                 Matter.Body.setVelocity(this.player.body, {
                     x: this.ship.body.velocity.x,
                     y: this.ship.body.velocity.y
                 });
+                
+                // Fire cannons with spacebar when at the wheel
+                if (this.keysPressed.has(' ')) {
+                    // Fire cannons using mouse position as target
+                    this.ship.fireCannon(this.mousePosition);
+                    // Remove spacebar from pressed keys to prevent continuous firing
+                    this.keysPressed.delete(' ');
+                }
                 
                 // Ensure player body is a sensor (non-colliding) when at wheel
                 if (!this.player.body.isSensor) {
@@ -633,15 +594,15 @@ export class Game {
                             y: this.player.position.y + moveY
                         };
                         
-                        if (this.ship.isPositionOnDeck(newPosYOnly.x, newPosYOnly.y)) {
-                            // Y-only movement is valid
-                            this.player.position.y = newPosYOnly.y;
-                            Matter.Body.setPosition(this.player.body, {
-                                x: this.player.position.x,
-                                y: newPosYOnly.y
-                            });
-                        }
-                    }
+    if (this.ship.isPositionOnDeck(newPosYOnly.x, newPosYOnly.y)) {
+        // Y-only movement is valid
+        this.player.position.y = newPosYOnly.y;
+        Matter.Body.setPosition(this.player.body, {
+            x: this.player.position.x,
+            y: newPosYOnly.y
+        });
+    }
+}
                     
                     // When walking on deck, player should not be a sensor
                     if (this.player.body.isSensor) {
@@ -708,10 +669,9 @@ export class Game {
                 Matter.Body.set(this.player.body, 'isSensor', false);
             }
         }
-        
-        // Spacebar to fire cannons when on ship (regardless of whether at wheel or not)
+          // Spacebar to fire cannons when on ship (regardless of whether at wheel or not)
         if (this.playerOnShip && this.keysPressed.has(' ')) {
-            this.ship.fireCannon();
+            this.ship.fireCannon(this.mousePosition);
             // Remove space from pressed keys to prevent continuous firing
             this.keysPressed.delete(' ');
         }
@@ -798,8 +758,10 @@ export class Game {
             this.ctx.arc(enemy.position.x, enemy.position.y, 15, 0, Math.PI * 2);
             this.ctx.fill();
         }
+          // Draw additional game elements like islands, etc.
         
-        // Draw additional game elements like islands, etc.
+        // Draw cannonballs - moved here to be drawn with proper camera transform
+        this.drawCannonballs();
         
         // Draw debug collision shapes if debug mode is enabled
         if (this.debugMode) {
@@ -896,11 +858,18 @@ export class Game {
             let totalOpenness = 0;
             let totalAngle = 0;
             let sailCount = 0;
-            
-            this.ship.modules.forEach(module => {
+              this.ship.modules.forEach(module => {
                 if (module.type === 'sail') {
-                    totalOpenness += (module.openness !== undefined ? module.openness : 0);
-                    totalAngle += (module.angle !== undefined ? module.angle : 0);
+                    if (module instanceof SailModule) {
+                        // If it's a SailModule, use its properties directly
+                        totalOpenness += module.openness;
+                        totalAngle += module.angle;
+                    } else {
+                        // For legacy ShipModule, use type assertion
+                        const sailModule = module as ShipModule;
+                        totalOpenness += (sailModule.openness !== undefined ? sailModule.openness : 0);
+                        totalAngle += (sailModule.angle !== undefined ? sailModule.angle : 0);
+                    }
                     sailCount++;
                 }
             });
@@ -1148,14 +1117,14 @@ export class Game {
             this.ctx.lineTo(endX, y);
             this.ctx.stroke();
             
-            // Add coordinate labels at major grid lines (every 500 units)
-            if (y % 500 === 0) {
-                this.ctx.fillStyle = gridColor;
-                this.ctx.font = '10px Arial';
-                this.ctx.textAlign = 'left';
-                this.ctx.fillText(y.toString(), startX + 5, y + 15);
-            }
-        }
+    // Add coordinate labels at major grid lines (every 500 units)
+    if (y % 500 === 0) {
+        this.ctx.fillStyle = gridColor;
+        this.ctx.font = '10px Arial';
+        this.ctx.textAlign = 'left';
+        this.ctx.fillText(y.toString(), startX + 5, y + 15);
+    }
+}
         
         // Draw a highlighted grid line at origin (0,0)
         if (0 >= startY && 0 <= endY) {
@@ -1371,9 +1340,92 @@ export class Game {
         const wheelCoords = this.shipToWorldCoordinates(-90, 0);
         this.ctx.fillText(`Wheel Position: ${Math.round(wheelCoords.x)}, ${Math.round(wheelCoords.y)}`, 20, 50);
         
-        this.ctx.restore();
+        this.ctx.restore();    }    // Update cannon turret angles based on mouse position
+    private updateCannonAiming(): void {
+        // Only aim cannons when player is on ship, at the wheel, and holding right mouse button
+        if (!this.playerOnShip || !this.player.atShipWheel || !this.rightMouseDown) return;
+        
+        // Get all cannon modules
+        const cannons = Array.from(this.ship.modules.values()).filter(module => module.type === 'cannon');
+        
+        // Calculate local mouse position relative to ship
+        const localMousePos = this.worldToShipCoordinates(
+            this.mousePosition.x,
+            this.mousePosition.y
+        );// Update each cannon's turret angle to point toward mouse position
+        cannons.forEach(cannon => {            // Calculate angle from cannon to mouse
+            const dx = localMousePos.x - cannon.position.x;
+            const dy = localMousePos.y - cannon.position.y;
+            
+            // Use the new aimAt method if it's a CannonModule
+            if (cannon instanceof CannonModule) {
+                // Pass local mouse position to aim at
+                cannon.aimAt(localMousePos.x, localMousePos.y);
+            } 
+        });
+    }    // Reset cannon angles to their default position
+    private resetCannonAngles(): void {
+        if (!this.playerOnShip) return;
+        
+        // Get all cannon modules
+        const cannons = Array.from(this.ship.modules.values()).filter(module => module.type === 'cannon');
+          // Reset each cannon's turret angle to its default
+        cannons.forEach(cannon => {
+            // Check if it's a proper CannonModule
+            if (cannon instanceof CannonModule) {
+                // Use the new resetAim method
+                cannon.resetAim();
+            } else {
+                // For legacy modules, use type assertion
+                const cannonModule = cannon as ShipModule;
+                cannonModule.turretAngle = 0;
+            }
+        });
     }
-
+      
+    // Add a cannonball to the game
+    addCannonball(x: number, y: number, angle: number, speed: number = 10): void {
+        // Log cannonball creation details
+        console.log('Creating cannonball:', {
+            position: { x, y },
+            angle: angle * (180/Math.PI), // Convert to degrees for readability
+            speed: speed
+        });
+          const cannonball = new Cannonball(x, y, angle, speed);
+        this.cannonballs.push(cannonball);
+        
+        // Add cannonball physics body to the world
+        Matter.World.add(this.engine.world, cannonball.body);
+    }
+    
+    // Update and manage cannonballs
+    private updateCannonballs(): void {
+        // Update each cannonball and remove dead ones
+        for (let i = this.cannonballs.length - 1; i >= 0; i--) {
+            const cannonball = this.cannonballs[i];
+            
+            // Update cannonball and check if it's still alive
+            const isAlive = cannonball.update();
+            
+            if (!isAlive) {                // Remove cannonball from physics world
+                Matter.World.remove(this.engine.world, cannonball.body);
+                
+                // Remove from our array
+                this.cannonballs.splice(i, 1);
+            }
+        }
+        
+        // Check for collisions with enemies
+        // In a full implementation, we would use Matter.js collision events
+    }
+    
+    // Draw all cannonballs
+    private drawCannonballs(): void {
+        for (const cannonball of this.cannonballs) {
+            cannonball.draw(this.ctx);
+        }
+    }
+    
     private gameLoop(): void {
         // Update game state and render each frame
         requestAnimationFrame(() => {
@@ -1488,13 +1540,20 @@ export class Game {
         
         // Update camera to follow player
         this.updateCamera();
-        
-        // Update mouse world position based on the latest camera position
-        if (this.screenMousePosition.x !== 0 || this.screenMousePosition.y !== 0) {
-            this.mousePosition = this.screenToWorldCoordinates(
+          // Update mouse world position based on the latest camera position
+        if (this.screenMousePosition.x !== 0 || this.screenMousePosition.y !== 0) {            this.mousePosition = this.screenToWorldCoordinates(
                 this.screenMousePosition.x,
                 this.screenMousePosition.y
             );
+            
+            // Keep cannons aimed at the current mouse position only when player is at the wheel and holding right click
+            if (this.playerOnShip && this.player.atShipWheel && this.rightMouseDown) {
+                this.updateCannonAiming();
+            }
         }
+        
+        // Update cannonballs
+        this.updateCannonballs();
     }
+      // This method has been moved to avoid duplicate declaration
 }
